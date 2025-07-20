@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+cs336_systems/__init__.py
+cs336_systems/benchmarking.py
+cs336_systems.egg-info/PKG-INFO
+cs336_systems.egg-info/SOURCES.txt
+cs336_systems.egg-info/dependency_links.txt
+cs336_systems.egg-info/requires.txt
+cs336_systems.egg-info/top_level.txt
+tests/__init__.py
+tests/adapters.py
+tests/common.py
+tests/conftest.py
+tests/test_attention.py
+tests/test_ddp.py
+tests/test_ddp_individual_parameters.py
+tests/test_sharded_optimizer.py
