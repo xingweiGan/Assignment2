@@ -130,6 +130,7 @@ def benchmark_model(model, input_ids, targets, warmup_steps, measurement_steps, 
     # Memory tracking
     torch.cuda.reset_peak_memory_stats()
     initial_memory = torch.cuda.memory_allocated()
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU,
@@ -167,7 +168,10 @@ def benchmark_model(model, input_ids, targets, warmup_steps, measurement_steps, 
             print(f"Step {step + 1}/{measurement_steps} - Forward: {forward_time:.6f}s" + 
                   (f", Backward: {backward_times[-1]:.6f}s" if not forward_only else ""))
 
-
+# Save a pickle file to be loaded by PyTorch's online tool. 
+    torch.cuda.memory._dump_snapshot("memory_snapshot.pickle") 
+# Stop recording history. 
+    torch.cuda.memory._record_memory_history(enabled=None)
     return forward_times, backward_times
 
 
