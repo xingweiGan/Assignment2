@@ -17,6 +17,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -92,7 +93,29 @@ def flash_fwd_kernel(
         # Compute tile of pre-softmax attention scores S_i^(j) = Q_i(K^(j))^T / √d
         S_ij = tl.dot(Q_i, tl.trans(K_j))
         S_ij = S_ij * scale
-        
+ 
+        # ← ← ← MODIFIED BELOW (was different implementation) ← ← ←
+        # Apply causal masking if needed
+        if is_causal:
+            # Construct index vectors for queries and keys
+            # Query indices for this tile
+            q_start = query_tile_index * Q_TILE_SIZE
+            q_indices = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]  # Shape: (Q_TILE_SIZE, 1)
+            
+            # Key indices for current key tile j  
+            k_start = j * K_TILE_SIZE
+            k_indices = k_start + tl.arange(0, K_TILE_SIZE)[None, :]  # Shape: (1, K_TILE_SIZE)
+            
+            # Compare indices to form square mask of size Bq × Bk
+            causal_mask = q_indices >= k_indices  # Shape: (Q_TILE_SIZE, K_TILE_SIZE)
+            
+            # For masked out elements, add -1e6 to attention scores
+            S_ij = tl.where(causal_mask, S_ij, S_ij + (-1e6))
+        # ← ← ← MODIFIED ABOVE ← ← ←
+
+
+
+
         # Compute m_i^(j) = max(m_i^(j-1), rowmax(S_i^(j)))
         m_i_new = tl.maximum(m_i, tl.max(S_ij, axis=1))
         
@@ -170,7 +193,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         # Calculate grid dimensions
         Tq = triton.cdiv(seq_len_q, Q_TILE_SIZE)
         grid = (Tq, total_batch_size)
-        
+        # ← ← ← ADDED BELOW ← ← ←
+        # Save the mask flag for backward
+        ctx.is_causal = is_causal
+        # ← ← ← ADDED ABOVE ← ← ←
         # Launch kernel
         flash_fwd_kernel[grid](
             Q, K, V, O, L,
@@ -184,6 +210,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             D=d_model,
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
+            is_causal=is_causal,
         )
         
         # Reshape output back to original shape
