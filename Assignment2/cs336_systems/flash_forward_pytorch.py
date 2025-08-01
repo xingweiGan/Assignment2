@@ -103,22 +103,101 @@ class FlashAttentionPyTorch(torch.autograd.Function):
         ctx.save_for_backward(Q, K, V, O, L)
         
         return O  # Return only O, not the tuple
-    
-    @staticmethod
-    def backward(ctx, grad_O, grad_L):
-        # For now, raise NotImplementedError as instructed
-        raise NotImplementedError("Backward pass not implemented yet")
 
-# Wrapper function to match the required interface
-def flash_attention_pytorch(Q, K, V, is_causal=False):
-    """
-    Wrapper function for FlashAttention PyTorch implementation
-    
-    Args:
-        Q, K, V: Input tensors
-        is_causal: Causal masking flag
+
+    @staticmethod
+    def backward(ctx, dO):
+        """
+        FlashAttention-2 backward pass implementation
+        Following equations (13)-(19) from the paper
         
-    Returns:
-        O: Attention output
-    """
-    return FlashAttentionPyTorch.apply(Q, K, V, is_causal)
+        Args:
+            ctx: Context object containing saved tensors from forward pass
+            dO: Gradient flowing back from next layer [batch, seq_len, d_model]
+            
+        Returns:
+            grad_Q, grad_K, grad_V, grad_is_causal: Gradients w.r.t. forward inputs
+        """
+        # Retrieve saved tensors from forward pass
+        Q, K, V, O, L = ctx.saved_tensors
+        original_shape = Q.shape
+        seq_len_q, d_model = Q.shape[-2:]
+        seq_len_k = K.shape[-2]
+        # Get original shape and flatten (same as forward)
+        Q = Q.view(-1, seq_len_q, d_model)
+        K = K.view(-1, seq_len_k, d_model)
+        V = V.view(-1, seq_len_k, d_model)
+        O = O.view(-1, seq_len_q, d_model)
+        L = L.view(-1, seq_len_q)
+        dO = dO.view(-1, seq_len_q, d_model)
+        
+        flattened_batch = Q.shape[0]
+        scale = 1.0 / math.sqrt(d_model)
+        
+        # Initialize gradient tensors
+        grad_Q = torch.zeros_like(Q)
+        grad_K = torch.zeros_like(K)
+        grad_V = torch.zeros_like(V)
+        
+        # Use same tile sizes as forward pass
+        B_q = min(64, seq_len_q)
+        B_k = min(64, seq_len_k)
+        
+        # Split tensors into tiles
+        Q_tiles = Q.split(B_q, dim=1)
+        K_tiles = K.split(B_k, dim=1)
+        V_tiles = V.split(B_k, dim=1)
+        O_tiles = O.split(B_q, dim=1)
+        L_tiles = L.split(B_q, dim=1)
+        dO_tiles = dO.split(B_q, dim=1)
+        
+        # Compute D vector (equation after 19): D_i = rowsum(dO_i ⊙ O_i)
+        D = torch.sum(dO * O, dim=-1)  # [flattened_batch, seq_len_q]
+        D_tiles = D.split(B_q, dim=1)
+        
+        # Process each tile pair (i,j) where i=query tile, j=key/value tile
+        for i, (Q_i, O_i, L_i, dO_i, D_i) in enumerate(zip(Q_tiles, O_tiles, L_tiles, dO_tiles, D_tiles)):
+            current_seq_len_q = Q_i.shape[1]
+            
+            for j, (K_j, V_j) in enumerate(zip(K_tiles, V_tiles)):
+                current_seq_len_k = K_j.shape[1]
+                
+                # Recompute attention scores and probabilities for this tile pair
+                # Following equation (13): S = QK^T / √d
+                S_ij = torch.matmul(Q_i, K_j.transpose(-1, -2)) * scale  # [batch, B_q, B_k]
+                
+                # Following equation (14): P_ij = exp(S_ij - L_i)
+                # Note: L_i contains logsumexp, so this gives us normalized probabilities
+                P_ij = torch.exp(S_ij - L_i.unsqueeze(-1))  # [batch, B_q, B_k]
+                
+                # Following equation (15): dV = P^T dO
+                # Accumulate gradients for V tile j
+                start_k = j * B_k
+                end_k = start_k + current_seq_len_k
+                grad_V[:, start_k:end_k, :] += torch.matmul(P_ij.transpose(-1, -2), dO_i)
+                
+                # Following equation (16): dP = dO V^T
+                dP_ij = torch.matmul(dO_i, V_j.transpose(-1, -2))  # [batch, B_q, B_k]
+                
+                # Following equation (17): dS_ij = P_ij ⊙ (dP_ij - D_i)
+                # D_i needs to be broadcasted to match dP_ij shape
+                dS_ij = P_ij * (dP_ij - D_i.unsqueeze(-1))  # [batch, B_q, B_k]
+                
+                # Following equation (18): dQ = dS K / √d
+                # Accumulate gradients for Q tile i
+                start_q = i * B_q
+                end_q = start_q + current_seq_len_q
+                grad_Q[:, start_q:end_q, :] += torch.matmul(dS_ij, K_j) * scale
+                
+                # Following equation (19): dK = dS^T Q / √d
+                # Accumulate gradients for K tile j
+                start_k = j * B_k
+                end_k = start_k + current_seq_len_k
+                grad_K[:, start_k:end_k, :] += torch.matmul(dS_ij.transpose(-1, -2), Q_i) * scale
+        
+        # Reshape gradients back to original shape
+        grad_Q = grad_Q.view(original_shape)
+        grad_K = grad_K.view(original_shape)
+        grad_V = grad_V.view(original_shape)
+        
+        return grad_Q, grad_K, grad_V, None  # None for is_causal gradient
