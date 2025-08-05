@@ -13,15 +13,14 @@ def setup(rank, world_size):
 def benchmark_allreduce(rank, world_size):
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-    #tensor = torch.ones(500_000_000, device=device) * rank  # ~2 GB per GPU, create tensor on GPU.
-    tensor= torch.randint(0,10,(3,), device=device)
+    #tensor = torch.ones(600_000_000, device=device) * rank  # ~2 GB per GPU, create tensor on GPU.
+    tensor= torch.randint(0,10,(3000_000_000,), device=device)
+    dist.barrier()              # CPU-side sync
     torch.cuda.synchronize()
-
-    print("0")
     start = time.time()
     dist.all_reduce(tensor, async_op=False)
-    end = time.time()
     torch.cuda.synchronize()
+    end = time.time()
     print(f"[Rank {rank}] All-reduce on GPU took {end - start:.3f} seconds")
 
 
