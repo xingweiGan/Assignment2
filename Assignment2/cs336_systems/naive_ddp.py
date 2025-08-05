@@ -15,22 +15,20 @@ class ToyModel(nn.Module):
 
 # -------------------------------- PG setup / teardown
 def setup(rank, world_size):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "9776"        # <- fixed port
     dist.init_process_group(                  # 2️⃣ then create PG
         backend="nccl",
         rank=rank,
-        world_size=world_size,
-        # no device_ids kwarg in <2.3
-    )
+        world_size=world_size)
+    torch.cuda.set_device(rank)
 
-def cleanup():
-    dist.destroy_process_group()
 
 # -------------------------------- training loop
 def train(rank, world_size, steps=50, batch=32, lr=1e-2):
     setup(rank, world_size)
-
+    print(rank)
+    device = torch.device(f"cuda:{rank}")
     model = ToyModel().cuda(rank)
     opt   = torch.optim.SGD(model.parameters(), lr=lr)
     lossf = nn.MSELoss()
@@ -46,14 +44,24 @@ def train(rank, world_size, steps=50, batch=32, lr=1e-2):
         # naive DDP: average grads
         for p in model.parameters():
             if p.grad is None: continue
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            dist.all_reduce(p.grad, async_op=False)
             p.grad /= world_size
 
         opt.step()
-        if rank == 0 and (step + 1) % 10 == 0:
+        if (step + 1) % 10 == 0:
             print(f"step {step+1:3d}  loss {lossf(model(x), y).item():.4f}")
+    
 
-    cleanup()
+    # PyTorch recommended cleanup sequence:
+    print("a")
+    torch.cuda.synchronize()        # 1. Wait for GPU operations-not all reduce but maybe sth like cleanup.
+    print("b")
+    dist.barrier()                  # 2. Let all CPU wait for each other.  
+    print("c")
+    dist.destroy_process_group()    # 3. Clean NCCL for all CPU processes.
+
+
+
 
 # -------------------------------- entry point
 if __name__ == "__main__":
