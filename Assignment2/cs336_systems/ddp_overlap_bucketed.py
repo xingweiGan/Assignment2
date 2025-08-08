@@ -2,70 +2,73 @@ import torch
 import torch.distributed as dist
 from typing import Any, Dict, List
 
-_MB = 1024 * 1024
+_MB = 1024 * 1024  # bytes in 1 MiB
 
 
 class DDPBucketed(torch.nn.Module):
-    """Manual Distributed Data Parallel wrapper with *gradient bucketing*.
+    """A *manual* Distributed Data‑Parallel wrapper that **buckets** gradients.
 
-    • Broadcasts initial parameters from rank‑0 so every worker starts equal.
-    • Builds buckets (lists of parameters) whose total size ≤ *bucket_size_mb*.
-    • Registers a *post‑accumulate* hook on every parameter.  When all params in
-      a bucket have their gradients ready, we launch **one async all‑reduce per
-      parameter** in that bucket (still fewer calls than per‑parameter and
-      fully overlaps with remaining backward work).
-    • `finish_gradient_synchronization()` waits for the queued collectives and
-      converts the NCCL/Gloo «sum» into an average so optimizers behave as
-      expected.
+    *   **Broadcasts** rank‑0 parameters so every worker starts identical.
+    *   **Buckets** only parameters that *require gradients*; each bucket’s
+        byte‑size ≤ ``bucket_size_mb`` (or unlimited when ``None``).
+    *   When all grads in a bucket become ready during backward, we **flatten &
+        launch one async ``all_reduce``** – reducing comm calls from *N params*
+        to *N buckets*.
+    *   :py:meth:`finish_gradient_synchronization` waits, scatters the reduced
+        tensor back into each ``p.grad``, and averages by ``world_size`` so the
+        optimiser sees the same update as on a single GPU.
     """
 
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     def __init__(self, module: torch.nn.Module, bucket_size_mb: float):
         super().__init__()
-
         if not dist.is_initialized():
             raise RuntimeError("init_process_group must be called before DDPBucketed")
 
-        self.module = module
+        self.module = module  # register as sub‑module so state_dict etc. work
         self.world_size = dist.get_world_size()
 
-        # 1) Ensure identical initial weights ------------------------------------------------
+        # ── 1 · Synchronise initial parameters ───────────────────────────────
         for p in self.module.parameters():
             dist.broadcast(p.data, src=0)
 
-        # 2) Build buckets -------------------------------------------------------------------
-        bucket_bytes_cap = float("inf") if bucket_size_mb is None else bucket_size_mb * _MB
-        self._buckets: List[Dict[str, Any]] = []  # each: {params, ready_cnt, handles}
+        # ── 2 · Build buckets (trainable params only) ────────────────────────
+        cap_bytes = float("inf") if bucket_size_mb is None else bucket_size_mb * _MB
 
-        current: List[torch.nn.Parameter] = []
-        current_size = 0
-        for p in reversed(list(self.module.parameters())):  # reverse = roughly backward order
-            param_bytes = p.numel() * p.element_size()
-            if current and current_size + param_bytes > bucket_bytes_cap:
-                self._buckets.append({"params": current, "ready_cnt": 0, "handles": []})
-                current, current_size = [], 0
-            current.append(p)
-            current_size += param_bytes
-        if current:
-            self._buckets.append({"params": current, "ready_cnt": 0, "handles": []})
+        self._buckets: List[Dict[str, Any]] = []  # runtime state per bucket
+        cur_params: List[torch.nn.Parameter] = []
+        cur_bytes = 0
 
-        # 3) Register hooks ------------------------------------------------------------------
-        for bucket_idx, bucket in enumerate(self._buckets):
+        trainable_params = [p for p in self.module.parameters() if p.requires_grad]
+        for p in reversed(trainable_params):  # reversed ≈ grad‑ready order
+            p_bytes = p.numel() * p.element_size()
+            if cur_params and cur_bytes + p_bytes > cap_bytes:
+                self._buckets.append({"params": cur_params, "ready": 0, "handles": []})
+                cur_params, cur_bytes = [], 0
+            cur_params.append(p)
+            cur_bytes += p_bytes
+        if cur_params:
+            self._buckets.append({"params": cur_params, "ready": 0, "handles": []})
+
+        # ── 3 · Register per‑parameter hooks ─────────────────────────────────
+        for idx, bucket in enumerate(self._buckets):
             for p in bucket["params"]:
-                p.register_post_accumulate_grad_hook(self._make_hook(bucket_idx))
+                p.register_post_accumulate_grad_hook(self._make_hook(idx))
 
     # ------------------------------------------------------------------
     def _make_hook(self, bucket_idx: int):
-        """Return a hook that tracks readiness & queues all‑reduces for a bucket."""
+        """Return a hook that triggers the bucket‑wide ``all_reduce`` once."""
 
-        def _hook(param: torch.nn.Parameter):  # noqa: ANN001
+        def _hook(_param: torch.nn.Parameter):  # noqa: ANN001 – _param unused
             bucket = self._buckets[bucket_idx]
-            bucket["ready_cnt"] += 1
-            if bucket["ready_cnt"] == len(bucket["params"]):
-                # All grads in this bucket are ready – launch async all‑reduce per param
-                for p in bucket["params"]:
-                    h = dist.all_reduce(p.grad, async_op=True)
-                    bucket["handles"].append(h)
+            bucket["ready"] += 1
+            if bucket["ready"] == len(bucket["params"]):
+                # All grads in this bucket are now populated.
+                flat = torch.cat([p.grad.view(-1) for p in bucket["params"]])
+                flat = flat.to(bucket["params"][0].grad.device)
+                work = dist.all_reduce(flat, async_op=True)
+                bucket["handles"].append((work, flat))
+
         return _hook
 
     # ------------------------------------------------------------------
@@ -74,13 +77,19 @@ class DDPBucketed(torch.nn.Module):
 
     # ------------------------------------------------------------------
     def finish_gradient_synchronization(self):
-        """Wait on queued collectives and average gradients."""
+        """Wait on outstanding comms, scatter grads, and average."""
         for bucket in self._buckets:
-            for h in bucket["handles"]:
-                h.wait()
+            for work, flat in bucket["handles"]:
+                work.wait()
+                offset = 0
+                for p in bucket["params"]:
+                    n = p.numel()
+                    p.grad.copy_(flat[offset : offset + n].view_as(p.grad))
+                    offset += n
             bucket["handles"].clear()
-            bucket["ready_cnt"] = 0  # reset for next backward
+            bucket["ready"] = 0
 
+        # Average gradients (∑ / world_size)
         if self.world_size > 1:
             scale = 1.0 / self.world_size
             for p in self.module.parameters():
